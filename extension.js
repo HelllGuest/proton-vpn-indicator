@@ -1,6 +1,7 @@
-//    Proton VPN Button
+//    Proton VPN Indicator
 //    GNOME Shell extension
-//    @fthx 2025
+//    Fork of Proton VPN Button by @fthx (2025)
+//    Modified by @helllguest (2026)
 
 
 import Gio from 'gi://Gio';
@@ -25,6 +26,9 @@ const DESKTOP_IDS = [
     'com.protonvpn.www.desktop',
 ];
 const INACTIVE_VPN_ICON_OPACITY = 128;
+// Proton brand success green, used to tint the symbolic panel icon while
+// connected. The icon stays monochrome and themes to the panel otherwise.
+const CONNECTED_ICON_COLOR = '#1ea885';
 
 const APP_CONFIG_PATH = GLib.build_filenamev([
     GLib.get_home_dir(), '.config', 'Proton', 'VPN', 'app-config.json',
@@ -73,6 +77,36 @@ function formatServerName(connectionId) {
         .trim() || connectionId;
 }
 
+function formatProtocol(protocol) {
+    switch (protocol) {
+        case 'wireguard':
+            return 'WireGuard';
+        case 'openvpn-udp':
+            return 'OpenVPN (UDP)';
+        case 'openvpn-tcp':
+            return 'OpenVPN (TCP)';
+        default:
+            return protocol ?? '';
+    }
+}
+
+// Reads the Proton VPN app's persisted connection parameters. These are
+// written by the official app and hold richer details than NetworkManager
+// exposes: the exact server name, exit IP, and protocol.
+function readPersistedConnection() {
+    const data = readJsonFile(CONNECTION_PERSISTENCE_PATH);
+    if (!data?.connection_id)
+        return null;
+
+    return {
+        uuid: data.connection_id,
+        protocol: data.protocol ?? '',
+        serverName: data.server?.server_name ?? '',
+        serverLabel: data.server?.label ?? '',
+        serverIp: data.server?.server_ip ?? '',
+    };
+}
+
 
 const ProtonVPNButton = GObject.registerClass(
     class ProtonVPNButton extends PanelMenu.Button {
@@ -80,11 +114,17 @@ const ProtonVPNButton = GObject.registerClass(
             super._init(0.0, 'Proton VPN');
 
             this._opening = false;
+            this._openTimeoutId = null;
             this._nmHandlerId = null;
             this._vpnActiveConnection = null;
             this._connected = false;
             this._serverName = '';
+            this._protocol = '';
+            this._serverIp = '';
             this._pinnedItems = [];
+            this._configMonitor = null;
+            this._configMonitorId = null;
+            this._reconnectTimeoutId = null;
 
             const iconPath = `${path}/icons/protonvpn-symbolic.svg`;
             const gicon = Gio.icon_new_for_string(iconPath);
@@ -109,6 +149,29 @@ const ProtonVPNButton = GObject.registerClass(
                 if (isOpen)
                     this._updateMenu();
             });
+
+            this._setupConfigMonitor();
+        }
+
+        // Watch the app config so pinned servers refresh live when changed
+        // from the Proton VPN app, even while the menu is open.
+        _setupConfigMonitor() {
+            try {
+                const file = Gio.File.new_for_path(APP_CONFIG_PATH);
+                this._configMonitor = file.monitor_file(
+                    Gio.FileMonitorFlags.NONE,
+                    null,
+                );
+                this._configMonitorId = this._configMonitor.connect(
+                    'changed',
+                    () => {
+                        if (this.menu.isOpen)
+                            this._updateMenu();
+                    },
+                );
+            } catch (error) {
+                console.error('Proton VPN extension:', error);
+            }
         }
 
         _buildMenu() {
@@ -125,7 +188,12 @@ const ProtonVPNButton = GObject.registerClass(
                 'Connect to Fastest…',
                 () => this._openApp(),
             );
+            this._reconnectItem = this.menu.addAction('Reconnect', () => this._reconnect());
             this._disconnectItem = this.menu.addAction('Disconnect', () => this._disconnect());
+            this._copyIpItem = this.menu.addAction(
+                'Copy Server IP',
+                () => this._copyServerIp(),
+            );
 
             this._pinnedSection = new PopupMenu.PopupMenuSection();
             this.menu.addMenuItem(this._pinnedSection);
@@ -149,7 +217,6 @@ const ProtonVPNButton = GObject.registerClass(
             if (!pinned.length)
                 return;
 
-            this._pinnedSection.actor.show();
             this._pinnedItems.push(
                 this._pinnedSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Pinned')),
             );
@@ -176,14 +243,14 @@ const ProtonVPNButton = GObject.registerClass(
         _findProfileForServer(serverName) {
             const needle = serverName.toUpperCase();
             return this._getProtonProfiles().find(profile => {
-                return profile.get_id().toUpperCase().includes(needle);
+                return formatServerName(profile.get_id()).toUpperCase() === needle;
             }) ?? null;
         }
 
         _lastPersistedProfile() {
-            const persistence = readJsonFile(CONNECTION_PERSISTENCE_PATH);
-            if (persistence?.connection_id)
-                return this._findProfileByUuid(persistence.connection_id);
+            const persistence = readPersistedConnection();
+            if (persistence)
+                return this._findProfileByUuid(persistence.uuid);
 
             const profiles = this._getProtonProfiles();
             return profiles.length ? profiles[0] : null;
@@ -250,20 +317,61 @@ const ProtonVPNButton = GObject.registerClass(
             }
         }
 
+        _reconnect() {
+            const profile = this._lastPersistedProfile()
+                ?? this._vpnActiveConnection?.get_connection();
+            if (!profile) {
+                this._openApp();
+                return;
+            }
+
+            this._disconnect();
+
+            // Give NetworkManager a moment to tear down the tunnel before
+            // bringing it back up; reactivating mid-teardown can fail.
+            if (this._reconnectTimeoutId)
+                GLib.Source.remove(this._reconnectTimeoutId);
+            this._reconnectTimeoutId = GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT,
+                600,
+                () => {
+                    this._reconnectTimeoutId = null;
+                    this._activateProfile(profile);
+                    return GLib.SOURCE_REMOVE;
+                },
+            );
+        }
+
+        _copyServerIp() {
+            if (!this._serverIp)
+                return;
+
+            St.Clipboard.get_default().set_text(
+                St.ClipboardType.CLIPBOARD,
+                this._serverIp,
+            );
+            Main.notify('Proton VPN', `Server IP copied: ${this._serverIp}`);
+        }
+
         _updateMenu() {
             this._rebuildPinnedItems();
 
             if (this._connected) {
-                this._statusItem.label.text = this._serverName
-                    ? `Connected · ${this._serverName}`
-                    : 'Connected';
+                const parts = ['Connected'];
+                if (this._serverName)
+                    parts.push(this._serverName);
+                if (this._protocol)
+                    parts.push(formatProtocol(this._protocol));
+                this._statusItem.label.text = parts.join(' · ');
             } else {
                 this._statusItem.label.text = 'Not connected';
             }
 
             this._connectItem.actor.visible = !this._connected;
             this._connectFastestItem.actor.visible = !this._connected;
+            this._reconnectItem.actor.visible = this._connected;
             this._disconnectItem.actor.visible = this._connected;
+            this._copyIpItem.actor.visible = this._connected && !!this._serverIp;
 
             const hasPinned = this._pinnedItems.length > 0;
             this._pinnedSection.actor.visible = hasPinned;
@@ -287,17 +395,34 @@ const ProtonVPNButton = GObject.registerClass(
                 this._vpnActiveConnection = vpnConn;
                 this._connected = true;
                 this._icon.opacity = 255;
+                this._icon.set_style(`color: ${CONNECTED_ICON_COLOR};`);
 
                 const settings = vpnConn.get_connection()?.get_setting_connection();
                 const connectionId = settings?.get_id() ?? vpnConn.get_id();
                 this._serverName = formatServerName(connectionId);
+                this._protocol = '';
+                this._serverIp = '';
+
+                // Enrich with the app's persisted details when they describe
+                // the same connection NetworkManager reports as active.
+                const persistence = readPersistedConnection();
+                if (persistence && persistence.uuid === vpnConn.get_uuid()) {
+                    if (persistence.serverName)
+                        this._serverName = persistence.serverName;
+                    this._protocol = persistence.protocol;
+                    this._serverIp = persistence.serverIp;
+                }
+
                 this._label.text = this._serverName;
                 this._label.show();
             } else {
                 this._vpnActiveConnection = null;
                 this._connected = false;
                 this._serverName = '';
+                this._protocol = '';
+                this._serverIp = '';
                 this._icon.opacity = INACTIVE_VPN_ICON_OPACITY;
+                this._icon.set_style(null);
                 this._label.hide();
             }
 
@@ -309,8 +434,9 @@ const ProtonVPNButton = GObject.registerClass(
                 return;
             this._opening = true;
 
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+            this._openTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
                 this._opening = false;
+                this._openTimeoutId = null;
                 return GLib.SOURCE_REMOVE;
             });
 
@@ -361,6 +487,24 @@ const ProtonVPNButton = GObject.registerClass(
 
         destroy() {
             this._clearPinnedItems();
+
+            if (this._openTimeoutId) {
+                GLib.Source.remove(this._openTimeoutId);
+                this._openTimeoutId = null;
+            }
+
+            if (this._reconnectTimeoutId) {
+                GLib.Source.remove(this._reconnectTimeoutId);
+                this._reconnectTimeoutId = null;
+            }
+
+            if (this._configMonitor) {
+                if (this._configMonitorId)
+                    this._configMonitor.disconnect(this._configMonitorId);
+                this._configMonitor.cancel();
+                this._configMonitor = null;
+                this._configMonitorId = null;
+            }
 
             if (this._nmHandlerId && this._nmClient) {
                 this._nmClient.disconnect(this._nmHandlerId);
