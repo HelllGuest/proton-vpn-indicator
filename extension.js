@@ -214,25 +214,23 @@ const ProtonVPNButton = GObject.registerClass(
             this._geoMonitorId = null;
             this._geoRefreshTimeoutId = null;
             this._reconnectTimeoutId = null;
+            this._nmClient = null;
+            this._usingSymbolicIcon = false;
 
-            const iconPath = `${path}/icons/protonvpn-symbolic.svg`;
-            const gicon = Gio.icon_new_for_string(iconPath);
+            this._iconPathSymbolic = `${path}/icons/protonvpn-symbolic.svg`;
+            this._iconPathConnected = `${path}/icons/state-connected.svg`;
+            this._iconPathDisconnected = `${path}/icons/state-disconnected.svg`;
 
             this._box = new St.BoxLayout({ style_class: 'panel-status-menu-box' });
-            this._icon = new St.Icon({ style_class: 'system-status-icon', gicon });
+            this._icon = new St.Icon({ style_class: 'system-status-icon' });
+            this._setPanelIcon(false);
             this._label = new St.Label({ y_align: Clutter.ActorAlign.CENTER });
             this._box.add_child(this._icon);
             this._box.add_child(this._label);
             this.add_child(this._box);
 
             this._buildMenu();
-
-            this._nmClient = NM.Client.new(null);
-            this._nmHandlerId = this._nmClient.connect(
-                'notify::active-connections',
-                () => this._updateState(),
-            );
-            this._updateState();
+            this._initNmClient();
 
             this.menu.connect('open-state-changed', (_menu, isOpen) => {
                 if (isOpen)
@@ -241,6 +239,40 @@ const ProtonVPNButton = GObject.registerClass(
 
             this._setupConfigMonitor();
             this._setupGeoMonitor();
+        }
+
+        _initNmClient() {
+            NM.Client.new_async(null, (_source, result) => {
+                try {
+                    this._nmClient = NM.Client.new_finish(result);
+                } catch (error) {
+                    console.error('Proton VPN extension: NM client failed', error);
+                    this._nmClient = null;
+                    return;
+                }
+
+                if (!this._nmClient)
+                    return;
+
+                this._nmHandlerId = this._nmClient.connect(
+                    'notify::active-connections',
+                    () => this._updateState(),
+                );
+                this._updateState();
+            });
+        }
+
+        _setPanelIcon(connected) {
+            const preferred = connected
+                ? this._iconPathConnected
+                : this._iconPathDisconnected;
+            if (GLib.file_test(preferred, GLib.FileTest.IS_REGULAR)) {
+                this._icon.gicon = Gio.icon_new_for_string(preferred);
+                this._usingSymbolicIcon = false;
+            } else {
+                this._icon.gicon = Gio.icon_new_for_string(this._iconPathSymbolic);
+                this._usingSymbolicIcon = true;
+            }
         }
 
         // Watch the app config so pinned servers refresh live when changed
@@ -423,6 +455,8 @@ const ProtonVPNButton = GObject.registerClass(
         }
 
         _getProtonProfiles() {
+            if (!this._nmClient)
+                return [];
             return (this._nmClient.get_connections() ?? [])
                 .filter(isProtonConnectionProfile);
         }
@@ -449,7 +483,7 @@ const ProtonVPNButton = GObject.registerClass(
         }
 
         _activateProfile(profile) {
-            if (!profile)
+            if (!profile || !this._nmClient)
                 return;
 
             this._nmClient.activate_connection_async(
@@ -498,7 +532,7 @@ const ProtonVPNButton = GObject.registerClass(
         }
 
         _disconnect() {
-            if (!this._vpnActiveConnection)
+            if (!this._vpnActiveConnection || !this._nmClient)
                 return;
 
             try {
@@ -571,6 +605,9 @@ const ProtonVPNButton = GObject.registerClass(
         }
 
         _updateState() {
+            if (!this._nmClient)
+                return;
+
             const activeConns = this._nmClient.get_active_connections() ?? [];
 
             const vpnConn = activeConns.find(conn => {
@@ -587,8 +624,12 @@ const ProtonVPNButton = GObject.registerClass(
             if (vpnConn) {
                 this._vpnActiveConnection = vpnConn;
                 this._connected = true;
+                this._setPanelIcon(true);
                 this._icon.opacity = 255;
-                this._icon.set_style(`color: ${CONNECTED_ICON_COLOR};`);
+                // Symbolic fallback gets brand tint; state art keeps natural colors.
+                this._icon.set_style(
+                    this._usingSymbolicIcon ? `color: ${CONNECTED_ICON_COLOR};` : null,
+                );
 
                 const settings = vpnConn.get_connection()?.get_setting_connection();
                 const connectionId = settings?.get_id() ?? vpnConn.get_id();
@@ -614,6 +655,7 @@ const ProtonVPNButton = GObject.registerClass(
                 this._serverName = '';
                 this._protocol = '';
                 this._serverIp = '';
+                this._setPanelIcon(false);
                 this._icon.opacity = INACTIVE_VPN_ICON_OPACITY;
                 this._icon.set_style(null);
                 this._label.hide();
@@ -719,6 +761,9 @@ const ProtonVPNButton = GObject.registerClass(
 
 export default class ProtonVPNButtonExtension extends Extension {
     enable() {
+        // Drop legacy role from builds that used 'proton-vpn' instead of uuid.
+        Main.panel.statusArea['proton-vpn']?.destroy();
+
         this._button = new ProtonVPNButton(this.path);
         // Role must be unique per session; uuid avoids clashes with other Proton indicators.
         Main.panel.addToStatusArea(this.uuid, this._button);
@@ -727,5 +772,8 @@ export default class ProtonVPNButtonExtension extends Extension {
     disable() {
         this._button?.destroy();
         this._button = null;
+        // Button.destroy removes the actor; clear the registry slot if it remains.
+        if (Main.panel.statusArea[this.uuid])
+            delete Main.panel.statusArea[this.uuid];
     }
 }
