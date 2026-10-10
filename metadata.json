@@ -1,14 +1,15 @@
 {
-  "description": "Proton VPN button in the top panel.\n\nShows the connected server name. The menu offers connect, disconnect, pinned servers (from the Proton VPN app config), and opening the official app.\n\nThis extension is not affiliated, funded or in any way associated with Proton VPN.",
-  "name": "Proton VPN Button",
+  "description": "Proton VPN indicator for the top panel.\n\nShows the connected server name and protocol. The menu offers connect, reconnect, disconnect, copy server IP, pinned servers (from the Proton VPN app config), spoofed GeoClue location status, manual location sync, and opening the official app.\n\nThis extension is not affiliated, funded or in any way associated with Proton VPN.",
+  "name": "Proton VPN Indicator",
   "shell-version": [
     "46",
     "47",
     "48",
     "49",
-    "50"
+    "50",
+    "51"
   ],
-  "url": "https://github.com/fthx/proton-vpn",
-  "uuid": "proton-vpn@fthx",
-  "version": 999
+  "url": "https://github.com/helllguest/proton-vpn-indicator",
+  "uuid": "proton-vpn@helllguest",
+  "version": 5
 }
