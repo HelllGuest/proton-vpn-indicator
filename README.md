@@ -30,3 +30,8 @@ Wayland: log out and back in after install or metadata changes.
 ## License
 
 GPL-3.0 (see LICENSE), same family as upstream button extension.
+
+## Notes
+
+* Prefer `gnome-extensions disable` / `enable`. **Do not** `uninstall` if this tree is stowed from dotfiles — uninstall deletes the extension directory.
+* After metadata or code changes on Wayland, **log out and back in**. `ReloadExtension` is not implemented on current GNOME Shell.

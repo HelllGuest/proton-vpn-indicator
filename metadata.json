@@ -11,5 +11,8 @@
   ],
   "url": "https://github.com/helllguest/proton-vpn-indicator",
   "uuid": "proton-vpn@helllguest",
-  "version": 6
+  "version": 6,
+  "session-modes": [
+    "user"
+  ]
 }
